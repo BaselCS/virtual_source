@@ -40,6 +40,10 @@ MODE_VIDEO_AUDIO = "Video + Audio"
 MODE_VIDEO_ONLY = "Video Only"
 MODE_AUDIO_ONLY = "Audio Only"
 
+AUDIO_SRC_MIC = "Microphone (Phone Mic)"
+AUDIO_SRC_OUTPUT = "Internal Audio (Device Apps)"
+
+
 
 def list_android_cameras() -> list[tuple[str, str]]:
     """
@@ -87,7 +91,10 @@ def list_android_cameras() -> list[tuple[str, str]]:
 
 
 def _scrcpy_cmd(
-    mode: str, no_preview: bool = False, camera_id: str | None = None
+    mode: str,
+    no_preview: bool = False,
+    camera_id: str | None = None,
+    audio_source: str = "mic",
 ) -> list[str]:
     cmd = ["scrcpy"]
     cam_flags = []
@@ -98,6 +105,8 @@ def _scrcpy_cmd(
     else:
         cam_flags = ["--camera-facing=front"]
 
+    audio_src_flag = f"--audio-source={audio_source}"
+
     if mode == MODE_VIDEO_ONLY:
         cmd += [
             "--video-source=camera",
@@ -106,19 +115,24 @@ def _scrcpy_cmd(
             "--no-audio",
         ]
     elif mode == MODE_AUDIO_ONLY:
-        cmd += ["--no-video", "--audio-source=mic"]
+        cmd += [
+            "--no-video",
+            audio_src_flag,
+            "--audio-codec=opus",
+            "--audio-buffer=50",
+        ]
     else:
         cmd += [
             "--video-source=camera",
             *cam_flags,
             "--v4l2-sink=/dev/video0",
-            "--audio-source=mic",
+            audio_src_flag,
+            "--audio-codec=opus",
+            "--audio-buffer=50",
         ]
 
     if no_preview:
         cmd.append("--no-window")
-        if mode == MODE_VIDEO_AUDIO:
-            cmd.append("--no-audio")
 
     return cmd
 
@@ -157,6 +171,32 @@ def _list_sources() -> str:
         return f"  (error listing sources: {exc})"
 
 
+def _cleanup_stale_audio_modules() -> list[str]:
+    """Unload any leftover Phone_Audio_Sink or Phone_Virtual_Microphone modules."""
+    unloaded = []
+    try:
+        out = subprocess.run(
+            ["pactl", "list", "modules", "short"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                mod_id = parts[0]
+                mod_args = line.lower()
+                if "phone_audio_sink" in mod_args or "phone_virtual_microphone" in mod_args:
+                    try:
+                        _run_pactl(["unload-module", mod_id])
+                        unloaded.append(mod_id)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return unloaded
+
+
 # ---------------------------------------------------------------------------
 # Background worker
 # ---------------------------------------------------------------------------
@@ -170,18 +210,28 @@ class StreamWorker(QThread):
         super().__init__(parent)
         self._scrcpy_proc: subprocess.Popen | None = None
         self._null_sink_module_id: int | None = None
+        self._remap_source_module_id: int | None = None
         self._pw_loopback_proc: subprocess.Popen | None = None
         self._running = False
         self._mode = MODE_VIDEO_AUDIO
         self._no_preview = False
         self._camera_id: str | None = None
+        self._audio_source: str = "mic"
+        self._set_default_mic: bool = True
 
     def start_stream(
-        self, mode: str, no_preview: bool = False, camera_id: str | None = None
+        self,
+        mode: str,
+        no_preview: bool = False,
+        camera_id: str | None = None,
+        audio_source: str = "mic",
+        set_default_mic: bool = True,
     ) -> None:
         self._mode = mode
         self._no_preview = no_preview
         self._camera_id = camera_id
+        self._audio_source = audio_source
+        self._set_default_mic = set_default_mic
         self._running = True
         self.start()
 
@@ -195,8 +245,7 @@ class StreamWorker(QThread):
     # ------------------------------------------------------------------
     def run(self) -> None:
         try:
-            skip_audio = self._no_preview and self._mode not in (MODE_AUDIO_ONLY,)
-            if _need_audio(self._mode) and not skip_audio:
+            if _need_audio(self._mode):
                 self._setup_audio()
                 self._dump_audio_state()
             else:
@@ -218,47 +267,59 @@ class StreamWorker(QThread):
     # Audio — null sink (pactl) + virtual source (pw-loopback native)
     # ------------------------------------------------------------------
     def _setup_audio(self) -> None:
+        # 0. Clean up any leftover modules from previous runs
+        stale = _cleanup_stale_audio_modules()
+        if stale:
+            self.log_message.emit(f"[AUDIO] Cleaned up {len(stale)} stale module(s)")
+
         # 1. Null sink — scrcpy outputs its audio here
         self.log_message.emit("[AUDIO] Creating null sink …")
+        sink_props = (
+            f"device.description=\"{SINK_NAME}\" "
+            f"media.class=\"Audio/Sink\" "
+            f"device.icon_name=\"audio-sink\""
+        )
         out = _run_pactl(
             [
                 "load-module",
                 "module-null-sink",
                 f"sink_name={SINK_NAME}",
-                f"sink_properties=device.description={SINK_NAME}",
+                f"sink_properties={sink_props}",
             ]
         )
         self._null_sink_module_id = int(out)
-        self.log_message.emit(f"  → module id {self._null_sink_module_id}")
+        self.log_message.emit(f"  → null sink module id {self._null_sink_module_id}")
 
-        # 2. Virtual source via pw-loopback — creates a native PipeWire
-        #    node with media.class=Audio/Source/Virtual so EasyEffects,
-        #    OBS, Meet, Discord see it as a microphone input device.
+        # 2. Virtual microphone source via module-remap-source
         self.log_message.emit("[AUDIO] Creating virtual microphone source …")
-        pw_loopback_cmd = [
-            "pw-loopback",
-            "--capture-props",
-            f"target.object={SINK_NAME} stream.capture.sink=true node.passive=true",
-            "--playback-props",
-            f"media.class=Audio/Source/Virtual node.name={REMAP_NAME} "
-            f"node.description={REMAP_NAME}",
-        ]
-        self.log_message.emit(f"[AUDIO] pw-loopback: {' '.join(pw_loopback_cmd)}")
-        try:
-            self._pw_loopback_proc = subprocess.Popen(
-                pw_loopback_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            import time
+        source_props = (
+            f"device.description=\"{REMAP_NAME}\" "
+            f"media.class=\"Audio/Source\" "
+            f"device.class=\"sound\" "
+            f"device.icon_name=\"audio-input-microphone\""
+        )
+        out_remap = _run_pactl(
+            [
+                "load-module",
+                "module-remap-source",
+                f"master={SINK_NAME}.monitor",
+                f"source_name={REMAP_NAME}",
+                f"source_properties={source_props}",
+            ]
+        )
+        self._remap_source_module_id = int(out_remap)
+        self.log_message.emit(
+            f"  → remap source module id {self._remap_source_module_id}"
+        )
 
-            time.sleep(0.5)
-            self.log_message.emit(f"  → pid {self._pw_loopback_proc.pid}")
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                "pw-loopback not found.  Install it with:\n"
-                "  sudo pacman -S pipewire"  # included in pipewire package
-            ) from exc
+        if self._set_default_mic:
+            try:
+                _run_pactl(["set-default-source", REMAP_NAME])
+                self.log_message.emit(
+                    f"[AUDIO] Set <b>{REMAP_NAME}</b> as active default system microphone input."
+                )
+            except Exception as exc:
+                self.log_message.emit(f"[AUDIO] Warning setting default source: {exc}")
 
     def _dump_audio_state(self) -> None:
         self.log_message.emit("[AUDIO] PipeWire nodes:")
@@ -268,8 +329,7 @@ class StreamWorker(QThread):
         for line in _list_sources().splitlines():
             self.log_message.emit(f"  {line}")
         self.log_message.emit(
-            f"[AUDIO] Ready — select <b>{REMAP_NAME}</b> "
-            f"in EasyEffects or your app's microphone input"
+            f"[AUDIO] Ready — <b>{REMAP_NAME}</b> is active and recognized by OS."
         )
 
     @staticmethod
@@ -300,14 +360,14 @@ class StreamWorker(QThread):
     # scrcpy
     # ------------------------------------------------------------------
     def _start_scrcpy(self) -> None:
-        cmd = _scrcpy_cmd(self._mode, self._no_preview, self._camera_id)
+        cmd = _scrcpy_cmd(
+            self._mode, self._no_preview, self._camera_id, self._audio_source
+        )
         self.log_message.emit(f"[SCRCPY] Launching: {' '.join(cmd)}")
         self.status_changed.emit("Running…")
 
         env = {**os.environ}
-        set_audio_env = _need_audio(self._mode) and not (
-            self._no_preview and self._mode == MODE_VIDEO_AUDIO
-        )
+        set_audio_env = _need_audio(self._mode)
         if set_audio_env:
             env["SDL_AUDIODRIVER"] = "pulseaudio"
             env["PULSE_SINK"] = SINK_NAME
@@ -330,7 +390,7 @@ class StreamWorker(QThread):
         self.log_message.emit(f"[SCRCPY] Started (pid {self._scrcpy_proc.pid})")
 
     def _ensure_scrcpy_audio_routed(self) -> bool:
-        """Ensure scrcpy audio streams are routed to Phone_Audio_Sink and not speaker/easyeffects sink."""
+        """Ensure scrcpy audio streams are routed to Phone_Audio_Sink and disconnected from physical speakers/easyeffects."""
         found = False
         try:
             # 1. Move sink input via pactl
@@ -357,24 +417,38 @@ class StreamWorker(QThread):
                     found = True
                     break
 
-            # 2. Reroute pw-link if connected to other sinks
-            links = subprocess.run(
+            # 2. Reroute PipeWire links statefully
+            pw_out = subprocess.run(
                 ["pw-link", "-l"], capture_output=True, text=True, timeout=3
-            ).stdout.splitlines()
-            for line in links:
-                if "scrcpy" in line.lower() and "|->" in line:
-                    parts = line.split("|->")
-                    src = parts[0].strip()
-                    dst = parts[1].strip()
-                    if SINK_NAME not in dst:
-                        subprocess.run(["pw-link", "-d", src, dst], capture_output=True)
-                        ch = "FL" if "FL" in src else ("FR" if "FR" in src else "")
-                        if ch:
-                            subprocess.run(
-                                ["pw-link", src, f"{SINK_NAME}:playback_{ch}"],
-                                capture_output=True,
+            ).stdout
+            current_src = None
+            for line in pw_out.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if "|->" in stripped:
+                    dst = stripped.split("|->")[1].strip()
+                    if current_src and "scrcpy" in current_src.lower():
+                        if SINK_NAME not in dst:
+                            self.log_message.emit(
+                                f"[AUDIO] Disconnecting scrcpy speaker preview link: {current_src} -> {dst}"
                             )
-                        found = True
+                            subprocess.run(
+                                ["pw-link", "-d", current_src, dst], capture_output=True
+                            )
+                            ch = (
+                                "FL"
+                                if "FL" in current_src
+                                else ("FR" if "FR" in current_src else "")
+                            )
+                            if ch:
+                                subprocess.run(
+                                    ["pw-link", current_src, f"{SINK_NAME}:playback_{ch}"],
+                                    capture_output=True,
+                                )
+                            found = True
+                elif "|<-" not in stripped:
+                    current_src = stripped
         except Exception as exc:
             self.log_message.emit(f"[AUDIO] Reroute warning: {exc}")
         return found
@@ -393,10 +467,8 @@ class StreamWorker(QThread):
         while self._running:
             events = poller.poll(500)
             loop_count += 1
-            if _need_audio(self._mode) and not routed and loop_count <= 20:
-                if self._no_preview:
-                    routed = True
-                elif self._ensure_scrcpy_audio_routed():
+            if _need_audio(self._mode) and (loop_count % 4 == 0 or not routed):
+                if self._ensure_scrcpy_audio_routed():
                     routed = True
 
             if events:
@@ -447,6 +519,17 @@ class StreamWorker(QThread):
                 self.log_message.emit("[AUDIO] pw-loopback ignored SIGKILL")
             self._pw_loopback_proc = None
 
+        if self._remap_source_module_id is not None:
+            try:
+                self.log_message.emit(
+                    f"[AUDIO] Unloading remap-source module {self._remap_source_module_id} …"
+                )
+                _run_pactl(["unload-module", str(self._remap_source_module_id)])
+                self.log_message.emit("[AUDIO] Virtual microphone unloaded.")
+            except RuntimeError as exc:
+                self.log_message.emit(f"[AUDIO] Warning: {exc}")
+            self._remap_source_module_id = None
+
         if self._null_sink_module_id is not None:
             try:
                 self.log_message.emit(
@@ -457,6 +540,8 @@ class StreamWorker(QThread):
             except RuntimeError as exc:
                 self.log_message.emit(f"[AUDIO] Warning: {exc}")
             self._null_sink_module_id = None
+
+        _cleanup_stale_audio_modules()
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +604,25 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._stop_btn)
         layout.addLayout(top_row)
 
+        # Audio options row
+        audio_row = QHBoxLayout()
+        self._audio_src_combo = QComboBox()
+        self._audio_src_combo.addItems([AUDIO_SRC_MIC, AUDIO_SRC_OUTPUT])
+        self._audio_src_combo.setToolTip("Select audio source on Android device")
+        self._audio_src_combo.setMinimumHeight(35)
+
+        lbl_src = QLabel("Audio Source:")
+        audio_row.addWidget(lbl_src)
+        audio_row.addWidget(self._audio_src_combo)
+
+        self._set_default_mic_cb = QCheckBox("Set as Default OS Microphone")
+        self._set_default_mic_cb.setChecked(True)
+        self._set_default_mic_cb.setToolTip(
+            "Automatically set Phone_Virtual_Microphone as default audio input source"
+        )
+        audio_row.addWidget(self._set_default_mic_cb)
+        layout.addLayout(audio_row)
+
         # v4l2loopback hint
         hint_group = QGroupBox("Prerequisite — v4l2loopback (run once per boot)")
         hint_layout = QVBoxLayout(hint_group)
@@ -538,7 +642,7 @@ class MainWindow(QMainWindow):
         # Virtual mic info
         self._mic_info = QLabel(
             "Virtual mic: <b>Phone_Virtual_Microphone</b> — "
-            "select it in EasyEffects / OBS / Meet"
+            "select it in EasyEffects / OBS / Meet / Discord"
         )
         self._mic_info.setWordWrap(True)
         self._mic_info.setStyleSheet("padding: 4px 0;")
@@ -546,7 +650,6 @@ class MainWindow(QMainWindow):
 
         # Log viewer
         log_group = QGroupBox("Log")
-        log_layout.addWidget(self._log_view) if False else None  # placeholder check
         log_layout = QVBoxLayout(log_group)
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
@@ -591,6 +694,10 @@ class MainWindow(QMainWindow):
         mode = self._mode_combo.currentText()
         no_preview = self._no_preview_cb.isChecked()
         camera_id = self._camera_combo.currentData()
+        audio_src_key = (
+            "mic" if self._audio_src_combo.currentText() == AUDIO_SRC_MIC else "output"
+        )
+        set_default_mic = self._set_default_mic_cb.isChecked()
 
         if mode != MODE_AUDIO_ONLY:
             if not self._check_v4l2loopback():
@@ -619,10 +726,12 @@ class MainWindow(QMainWindow):
         self._log_view.clear()
         self._status_lbl.setText("Starting…")
         self._append_log(
-            f"[GUI] Starting — mode: {mode}, camera_id: {camera_id}, no_preview: {no_preview}"
+            f"[GUI] Starting — mode: {mode}, camera_id: {camera_id}, audio_source: {audio_src_key}, set_default_mic: {set_default_mic}, no_preview: {no_preview}"
         )
         self._create_worker()
-        self._worker.start_stream(mode, no_preview, camera_id)
+        self._worker.start_stream(
+            mode, no_preview, camera_id, audio_src_key, set_default_mic
+        )
 
     @pyqtSlot()
     def _on_stop(self) -> None:
