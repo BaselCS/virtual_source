@@ -212,26 +212,28 @@ class StreamWorker(QThread):
         self._null_sink_module_id: int | None = None
         self._remap_source_module_id: int | None = None
         self._pw_loopback_proc: subprocess.Popen | None = None
+        self._loopback_module_id: int | None = None
         self._running = False
         self._mode = MODE_VIDEO_AUDIO
         self._no_preview = False
         self._camera_id: str | None = None
         self._audio_source: str = "mic"
-        self._set_default_mic: bool = True
+        self._set_default_mic: bool = False
+        self._mute_speaker_preview: bool = True
+        self._restart_requested: bool = False
 
     def start_stream(
         self,
         mode: str,
-        no_preview: bool = False,
         camera_id: str | None = None,
         audio_source: str = "mic",
-        set_default_mic: bool = True,
     ) -> None:
         self._mode = mode
-        self._no_preview = no_preview
+        self._no_preview = False
         self._camera_id = camera_id
         self._audio_source = audio_source
-        self._set_default_mic = set_default_mic
+        self._set_default_mic = False
+        self._mute_speaker_preview = True
         self._running = True
         self.start()
 
@@ -239,6 +241,23 @@ class StreamWorker(QThread):
         self._running = False
         self._kill_scrcpy()
         self._unload_modules()
+
+    def stop_cam_preview(self) -> None:
+        if not self._no_preview:
+            self.log_message.emit("[SCRCPY] Stopping camera preview (restarting headless)...")
+            self._no_preview = True
+            self._restart_requested = True
+            if self._scrcpy_proc:
+                self._scrcpy_proc.terminate()
+
+    def stop_mic_preview(self) -> None:
+        if self._loopback_module_id is not None:
+            self.log_message.emit("[AUDIO] Stopping microphone preview...")
+            try:
+                _run_pactl(["unload-module", str(self._loopback_module_id)])
+            except Exception as exc:
+                self.log_message.emit(f"[AUDIO] Warning: {exc}")
+            self._loopback_module_id = None
 
     # ------------------------------------------------------------------
     # Thread body
@@ -251,8 +270,14 @@ class StreamWorker(QThread):
             else:
                 self.log_message.emit("[AUDIO] Skipped")
 
-            self._start_scrcpy()
-            self._monitor_scrcpy()
+            while self._running:
+                self._start_scrcpy()
+                self._monitor_scrcpy()
+                if self._restart_requested:
+                    self._restart_requested = False
+                    continue
+                else:
+                    break
         except RuntimeError as exc:
             self.log_message.emit(f"[ERROR] {exc}")
             self.error_occurred.emit(str(exc))
@@ -312,14 +337,20 @@ class StreamWorker(QThread):
             f"  → remap source module id {self._remap_source_module_id}"
         )
 
-        if self._set_default_mic:
-            try:
-                _run_pactl(["set-default-source", REMAP_NAME])
-                self.log_message.emit(
-                    f"[AUDIO] Set <b>{REMAP_NAME}</b> as active default system microphone input."
-                )
-            except Exception as exc:
-                self.log_message.emit(f"[AUDIO] Warning setting default source: {exc}")
+        # 3. Audio Preview Loopback (plays mic to speakers)
+        self.log_message.emit("[AUDIO] Starting audio preview (loopback to speakers) …")
+        try:
+            out_loopback = _run_pactl(
+                [
+                    "load-module",
+                    "module-loopback",
+                    f"source={REMAP_NAME}",
+                    "latency_msec=50",
+                ]
+            )
+            self._loopback_module_id = int(out_loopback)
+        except Exception as exc:
+            self.log_message.emit(f"[AUDIO] Warning creating loopback: {exc}")
 
     def _dump_audio_state(self) -> None:
         self.log_message.emit("[AUDIO] PipeWire nodes:")
@@ -430,12 +461,13 @@ class StreamWorker(QThread):
                     dst = stripped.split("|->")[1].strip()
                     if current_src and "scrcpy" in current_src.lower():
                         if SINK_NAME not in dst:
-                            self.log_message.emit(
-                                f"[AUDIO] Disconnecting scrcpy speaker preview link: {current_src} -> {dst}"
-                            )
-                            subprocess.run(
-                                ["pw-link", "-d", current_src, dst], capture_output=True
-                            )
+                            if self._mute_speaker_preview:
+                                self.log_message.emit(
+                                    f"[AUDIO] Muting speaker preview: {current_src} -x {dst}"
+                                )
+                                subprocess.run(
+                                    ["pw-link", "-d", current_src, dst], capture_output=True
+                                )
                             ch = (
                                 "FL"
                                 if "FL" in current_src
@@ -488,7 +520,7 @@ class StreamWorker(QThread):
         exit_code = self._scrcpy_proc.wait()
         self.log_message.emit(f"[SCRCPY] Exited with code {exit_code}")
 
-        if self._running and exit_code != 0:
+        if self._running and exit_code != 0 and not self._restart_requested:
             self.error_occurred.emit(
                 f"scrcpy stopped unexpectedly (exit code {exit_code})"
             )
@@ -508,6 +540,14 @@ class StreamWorker(QThread):
         self._scrcpy_proc = None
 
     def _unload_modules(self) -> None:
+        if self._loopback_module_id is not None:
+            try:
+                self.log_message.emit("[AUDIO] Unloading loopback preview module …")
+                _run_pactl(["unload-module", str(self._loopback_module_id)])
+            except Exception:
+                pass
+            self._loopback_module_id = None
+
         if self._pw_loopback_proc is not None:
             pid = self._pw_loopback_proc.pid
             self.log_message.emit(f"[AUDIO] Killing pw-loopback pid {pid} …")
@@ -589,12 +629,6 @@ class MainWindow(QMainWindow):
         self._refresh_cams_btn.setToolTip("Query connected Android device for available cameras")
         top_row.addWidget(self._refresh_cams_btn)
 
-        self._no_preview_cb = QCheckBox("No Preview Window")
-        self._no_preview_cb.setToolTip(
-            "Stream video directly to /dev/video0 without opening a desktop preview window"
-        )
-        top_row.addWidget(self._no_preview_cb)
-
         self._start_btn = QPushButton("▶  Start")
         self._start_btn.setMinimumHeight(40)
         self._stop_btn = QPushButton("■  Stop")
@@ -603,6 +637,18 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._start_btn)
         top_row.addWidget(self._stop_btn)
         layout.addLayout(top_row)
+
+        # Preview Control Buttons
+        preview_row = QHBoxLayout()
+        self._stop_cam_preview_btn = QPushButton("Stop Cam Preview")
+        self._stop_mic_preview_btn = QPushButton("Stop Mic Preview")
+        self._stop_cam_preview_btn.setEnabled(False)
+        self._stop_mic_preview_btn.setEnabled(False)
+        self._stop_cam_preview_btn.setMinimumHeight(35)
+        self._stop_mic_preview_btn.setMinimumHeight(35)
+        preview_row.addWidget(self._stop_cam_preview_btn)
+        preview_row.addWidget(self._stop_mic_preview_btn)
+        layout.addLayout(preview_row)
 
         # Audio options row
         audio_row = QHBoxLayout()
@@ -614,13 +660,7 @@ class MainWindow(QMainWindow):
         lbl_src = QLabel("Audio Source:")
         audio_row.addWidget(lbl_src)
         audio_row.addWidget(self._audio_src_combo)
-
-        self._set_default_mic_cb = QCheckBox("Set as Default OS Microphone")
-        self._set_default_mic_cb.setChecked(True)
-        self._set_default_mic_cb.setToolTip(
-            "Automatically set Phone_Virtual_Microphone as default audio input source"
-        )
-        audio_row.addWidget(self._set_default_mic_cb)
+        audio_row.addStretch(1)
         layout.addLayout(audio_row)
 
         # v4l2loopback hint
@@ -664,6 +704,8 @@ class MainWindow(QMainWindow):
         self._start_btn.clicked.connect(self._on_start)
         self._stop_btn.clicked.connect(self._on_stop)
         self._refresh_cams_btn.clicked.connect(self._on_refresh_cameras)
+        self._stop_cam_preview_btn.clicked.connect(self._on_stop_cam_preview)
+        self._stop_mic_preview_btn.clicked.connect(self._on_stop_mic_preview)
 
     def _create_worker(self) -> None:
         self._worker = StreamWorker()
@@ -692,12 +734,10 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_start(self) -> None:
         mode = self._mode_combo.currentText()
-        no_preview = self._no_preview_cb.isChecked()
         camera_id = self._camera_combo.currentData()
         audio_src_key = (
             "mic" if self._audio_src_combo.currentText() == AUDIO_SRC_MIC else "output"
         )
-        set_default_mic = self._set_default_mic_cb.isChecked()
 
         if mode != MODE_AUDIO_ONLY:
             if not self._check_v4l2loopback():
@@ -723,24 +763,38 @@ class MainWindow(QMainWindow):
 
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+        self._stop_cam_preview_btn.setEnabled(True)
+        self._stop_mic_preview_btn.setEnabled(True)
         self._log_view.clear()
         self._status_lbl.setText("Starting…")
         self._append_log(
-            f"[GUI] Starting — mode: {mode}, camera_id: {camera_id}, audio_source: {audio_src_key}, set_default_mic: {set_default_mic}, no_preview: {no_preview}"
+            f"[GUI] Starting — mode: {mode}, camera_id: {camera_id}, audio_source: {audio_src_key}"
         )
         self._create_worker()
-        self._worker.start_stream(
-            mode, no_preview, camera_id, audio_src_key, set_default_mic
-        )
+        self._worker.start_stream(mode, camera_id, audio_src_key)
 
     @pyqtSlot()
     def _on_stop(self) -> None:
         self._status_lbl.setText("Stopping…")
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(False)
+        self._stop_cam_preview_btn.setEnabled(False)
+        self._stop_mic_preview_btn.setEnabled(False)
         self._append_log("[GUI] Stopping stream worker …")
         if self._worker is not None:
             self._worker.stop_stream()
+
+    @pyqtSlot()
+    def _on_stop_cam_preview(self) -> None:
+        self._stop_cam_preview_btn.setEnabled(False)
+        if self._worker is not None:
+            self._worker.stop_cam_preview()
+
+    @pyqtSlot()
+    def _on_stop_mic_preview(self) -> None:
+        self._stop_mic_preview_btn.setEnabled(False)
+        if self._worker is not None:
+            self._worker.stop_mic_preview()
 
     @pyqtSlot(str)
     def _on_error(self, msg: str) -> None:
@@ -748,11 +802,15 @@ class MainWindow(QMainWindow):
         self._status_lbl.setText("Error")
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._stop_cam_preview_btn.setEnabled(False)
+        self._stop_mic_preview_btn.setEnabled(False)
 
     @pyqtSlot()
     def _on_worker_finished(self) -> None:
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
+        self._stop_cam_preview_btn.setEnabled(False)
+        self._stop_mic_preview_btn.setEnabled(False)
         lbl = self._status_lbl.text()
         if lbl in ("Starting…", "Running…", "Stopping…", "Error"):
             self._status_lbl.setText("Ready")
