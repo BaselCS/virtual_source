@@ -105,6 +105,8 @@ def _scrcpy_cmd(
     no_preview: bool = False,
     camera_id: str | None = None,
     audio_source: str = "mic",
+    flip_h: bool = False,
+    flip_v: bool = False,
 ) -> list[str]:
     cmd = ["scrcpy"]
     cam_flags = []
@@ -114,6 +116,13 @@ def _scrcpy_cmd(
         cam_flags = ["--camera-facing=back"]
     else:
         cam_flags = ["--camera-facing=front"]
+
+    if flip_h and flip_v:
+        cam_flags.append("--capture-orientation=180")
+    elif flip_h:
+        cam_flags.append("--capture-orientation=flip0")
+    elif flip_v:
+        cam_flags.append("--capture-orientation=flip180")
 
     audio_src_flag = f"--audio-source={audio_source}"
 
@@ -231,17 +240,23 @@ class StreamWorker(QThread):
         self._set_default_mic: bool = False
         self._mute_speaker_preview: bool = True
         self._restart_requested: bool = False
+        self._flip_h: bool = False
+        self._flip_v: bool = False
 
     def start_stream(
         self,
         mode: str,
         camera_id: str | None = None,
         audio_source: str = "mic",
+        flip_h: bool = False,
+        flip_v: bool = False,
     ) -> None:
         self._mode = mode
         self._no_preview = False
         self._camera_id = camera_id
         self._audio_source = audio_source
+        self._flip_h = flip_h
+        self._flip_v = flip_v
         self._set_default_mic = False
         self._mute_speaker_preview = True
         self._running = True
@@ -259,6 +274,17 @@ class StreamWorker(QThread):
             self._restart_requested = True
             if self._scrcpy_proc:
                 self._scrcpy_proc.terminate()
+
+    def update_flip(self, flip_h: bool, flip_v: bool) -> None:
+        if self._flip_h == flip_h and self._flip_v == flip_v:
+            return
+        self._flip_h = flip_h
+        self._flip_v = flip_v
+        if self._running and self._scrcpy_proc:
+            self.log_message.emit("[SCRCPY] Restarting to apply new orientation...")
+            self.status_changed.emit("Restarting…")
+            self._restart_requested = True
+            self._scrcpy_proc.terminate()
 
     def stop_mic_preview(self) -> None:
         if self._loopback_module_id is not None:
@@ -402,7 +428,8 @@ class StreamWorker(QThread):
     # ------------------------------------------------------------------
     def _start_scrcpy(self) -> None:
         cmd = _scrcpy_cmd(
-            self._mode, self._no_preview, self._camera_id, self._audio_source
+            self._mode, self._no_preview, self._camera_id, self._audio_source,
+            self._flip_h, self._flip_v
         )
         self.log_message.emit(f"[SCRCPY] Launching: {' '.join(cmd)}")
         self.status_changed.emit("Running…")
@@ -649,6 +676,15 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._stop_btn)
         layout.addLayout(top_row)
 
+        # Video options row
+        video_options_row = QHBoxLayout()
+        self._flip_h_cb = QCheckBox("Flip Horizontal")
+        self._flip_v_cb = QCheckBox("Flip Vertical")
+        video_options_row.addWidget(self._flip_h_cb)
+        video_options_row.addWidget(self._flip_v_cb)
+        video_options_row.addStretch(1)
+        layout.addLayout(video_options_row)
+
         # Preview Control Buttons
         preview_row = QHBoxLayout()
         self._stop_cam_preview_btn = QPushButton("Stop Cam Preview")
@@ -717,11 +753,13 @@ class MainWindow(QMainWindow):
         self._refresh_cams_btn.clicked.connect(self._on_refresh_cameras)
         self._stop_cam_preview_btn.clicked.connect(self._on_stop_cam_preview)
         self._stop_mic_preview_btn.clicked.connect(self._on_stop_mic_preview)
+        self._flip_h_cb.stateChanged.connect(self._on_flip_changed)
+        self._flip_v_cb.stateChanged.connect(self._on_flip_changed)
 
     def _create_worker(self) -> None:
         self._worker = StreamWorker()
         self._worker.log_message.connect(self._append_log)
-        self._worker.status_changed.connect(self._status_lbl.setText)
+        self._worker.status_changed.connect(self._on_status_changed)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.finished.connect(self._on_worker_finished)
 
@@ -743,12 +781,30 @@ class MainWindow(QMainWindow):
             self._append_log("[GUI] No cameras returned (or no device connected). Using defaults.")
 
     @pyqtSlot()
+    def _on_flip_changed(self) -> None:
+        if self._worker is not None and self._worker._running:
+            flip_h = self._flip_h_cb.isChecked()
+            flip_v = self._flip_v_cb.isChecked()
+            self._flip_h_cb.setEnabled(False)
+            self._flip_v_cb.setEnabled(False)
+            self._worker.update_flip(flip_h, flip_v)
+
+    @pyqtSlot(str)
+    def _on_status_changed(self, status: str) -> None:
+        self._status_lbl.setText(status)
+        if status == "Running…":
+            self._flip_h_cb.setEnabled(True)
+            self._flip_v_cb.setEnabled(True)
+
+    @pyqtSlot()
     def _on_start(self) -> None:
         mode = self._mode_combo.currentText()
         camera_id = self._camera_combo.currentData()
         audio_src_key = (
             "mic" if self._audio_src_combo.currentText() == AUDIO_SRC_MIC else "output"
         )
+        flip_h = self._flip_h_cb.isChecked()
+        flip_v = self._flip_v_cb.isChecked()
 
         if mode != MODE_AUDIO_ONLY:
             if not self._check_v4l2loopback():
@@ -776,13 +832,15 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(True)
         self._stop_cam_preview_btn.setEnabled(True)
         self._stop_mic_preview_btn.setEnabled(True)
+        self._flip_h_cb.setEnabled(False)
+        self._flip_v_cb.setEnabled(False)
         self._log_view.clear()
         self._status_lbl.setText("Starting…")
         self._append_log(
             f"[GUI] Starting — mode: {mode}, camera_id: {camera_id}, audio_source: {audio_src_key}"
         )
         self._create_worker()
-        self._worker.start_stream(mode, camera_id, audio_src_key)
+        self._worker.start_stream(mode, camera_id, audio_src_key, flip_h, flip_v)
 
     @pyqtSlot()
     def _on_stop(self) -> None:
@@ -815,6 +873,8 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(False)
         self._stop_cam_preview_btn.setEnabled(False)
         self._stop_mic_preview_btn.setEnabled(False)
+        self._flip_h_cb.setEnabled(True)
+        self._flip_v_cb.setEnabled(True)
 
     @pyqtSlot()
     def _on_worker_finished(self) -> None:
@@ -822,8 +882,10 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(False)
         self._stop_cam_preview_btn.setEnabled(False)
         self._stop_mic_preview_btn.setEnabled(False)
+        self._flip_h_cb.setEnabled(True)
+        self._flip_v_cb.setEnabled(True)
         lbl = self._status_lbl.text()
-        if lbl in ("Starting…", "Running…", "Stopping…", "Error"):
+        if lbl in ("Starting…", "Running…", "Stopping…", "Restarting…", "Error"):
             self._status_lbl.setText("Ready")
 
     @pyqtSlot(str)
