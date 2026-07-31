@@ -11,6 +11,8 @@ import os
 import select
 import subprocess
 import sys
+import ctypes
+import signal
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QPalette, QColor
@@ -43,6 +45,14 @@ MODE_AUDIO_ONLY = "Audio Only"
 AUDIO_SRC_MIC = "Microphone (Phone Mic)"
 AUDIO_SRC_OUTPUT = "Internal Audio (Device Apps)"
 
+
+def _set_pdeathsig():
+    """Ensure child process is killed when parent dies (Linux only)."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(1, signal.SIGKILL)
+    except Exception:
+        pass
 
 
 def list_android_cameras() -> list[tuple[str, str]]:
@@ -412,6 +422,7 @@ class StreamWorker(QThread):
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                preexec_fn=_set_pdeathsig,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
