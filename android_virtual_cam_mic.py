@@ -1,10 +1,7 @@
 #!/usr/bin/python3
 """
 Android Virtual Webcam & Microphone — PyQt6 GUI for PipeWire/Arch Linux.
-
-Three modes: video only, audio only, or both.
-Wires an Android device (via scrcpy) into a v4l2loopback video device
-and/or a PipeWire virtual microphone using pw-loopback.
+VirtualSource Console Theme matching modern dark dashboard layout.
 """
 
 import os
@@ -13,9 +10,10 @@ import subprocess
 import sys
 import ctypes
 import signal
+from datetime import datetime
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QPalette, QColor
+from PyQt6.QtCore import QThread, Qt, pyqtSignal, pyqtSlot, QTimer
+from PyQt6.QtGui import QColor, QFont, QPainter, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -26,9 +24,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QTextEdit,
     QMessageBox,
-    QGroupBox,
     QComboBox,
-    QCheckBox,
+    QFrame,
 )
 
 
@@ -58,11 +55,6 @@ def _set_pdeathsig():
 def list_android_cameras() -> list[tuple[str, str]]:
     """
     Run `scrcpy --list-cameras` and return a list of (camera_id, display_label).
-    Example return:
-    [
-        ("0", "Camera 0 (back, 4080x3060)"),
-        ("1", "Camera 1 (front, 3264x2448)"),
-    ]
     """
     cameras = []
     try:
@@ -161,7 +153,7 @@ def _need_audio(mode: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Audio Helpers
 # ---------------------------------------------------------------------------
 def _run_pactl(args: list[str]) -> str:
     try:
@@ -235,6 +227,7 @@ class StreamWorker(QThread):
         self._running = False
         self._mode = MODE_VIDEO_AUDIO
         self._no_preview = False
+        self._stop_mic_preview = False
         self._camera_id: str | None = None
         self._audio_source: str = "mic"
         self._set_default_mic: bool = False
@@ -250,9 +243,12 @@ class StreamWorker(QThread):
         audio_source: str = "mic",
         flip_h: bool = False,
         flip_v: bool = False,
+        no_preview: bool = False,
+        stop_mic_preview: bool = False,
     ) -> None:
         self._mode = mode
-        self._no_preview = False
+        self._no_preview = no_preview
+        self._stop_mic_preview = stop_mic_preview
         self._camera_id = camera_id
         self._audio_source = audio_source
         self._flip_h = flip_h
@@ -275,6 +271,14 @@ class StreamWorker(QThread):
             if self._scrcpy_proc:
                 self._scrcpy_proc.terminate()
 
+    def start_cam_preview(self) -> None:
+        if self._no_preview:
+            self.log_message.emit("[SCRCPY] Starting camera preview (restarting with window)...")
+            self._no_preview = False
+            self._restart_requested = True
+            if self._scrcpy_proc:
+                self._scrcpy_proc.terminate()
+
     def update_flip(self, flip_h: bool, flip_v: bool) -> None:
         if self._flip_h == flip_h and self._flip_v == flip_v:
             return
@@ -287,6 +291,7 @@ class StreamWorker(QThread):
             self._scrcpy_proc.terminate()
 
     def stop_mic_preview(self) -> None:
+        self._stop_mic_preview = True
         if self._loopback_module_id is not None:
             self.log_message.emit("[AUDIO] Stopping microphone preview...")
             try:
@@ -295,9 +300,23 @@ class StreamWorker(QThread):
                 self.log_message.emit(f"[AUDIO] Warning: {exc}")
             self._loopback_module_id = None
 
-    # ------------------------------------------------------------------
-    # Thread body
-    # ------------------------------------------------------------------
+    def start_mic_preview(self) -> None:
+        self._stop_mic_preview = False
+        if self._running and self._loopback_module_id is None and _need_audio(self._mode):
+            self.log_message.emit("[AUDIO] Starting audio preview (loopback to speakers) …")
+            try:
+                out_loopback = _run_pactl(
+                    [
+                        "load-module",
+                        "module-loopback",
+                        f"source={REMAP_NAME}",
+                        "latency_msec=50",
+                    ]
+                )
+                self._loopback_module_id = int(out_loopback)
+            except Exception as exc:
+                self.log_message.emit(f"[AUDIO] Warning creating loopback: {exc}")
+
     def run(self) -> None:
         try:
             if _need_audio(self._mode):
@@ -324,16 +343,11 @@ class StreamWorker(QThread):
             self._unload_modules()
             self.finished.emit()
 
-    # ------------------------------------------------------------------
-    # Audio — null sink (pactl) + virtual source (pw-loopback native)
-    # ------------------------------------------------------------------
     def _setup_audio(self) -> None:
-        # 0. Clean up any leftover modules from previous runs
         stale = _cleanup_stale_audio_modules()
         if stale:
             self.log_message.emit(f"[AUDIO] Cleaned up {len(stale)} stale module(s)")
 
-        # 1. Null sink — scrcpy outputs its audio here
         self.log_message.emit("[AUDIO] Creating null sink …")
         sink_props = (
             f"device.description=\"{SINK_NAME}\" "
@@ -351,7 +365,6 @@ class StreamWorker(QThread):
         self._null_sink_module_id = int(out)
         self.log_message.emit(f"  → null sink module id {self._null_sink_module_id}")
 
-        # 2. Virtual microphone source via module-remap-source
         self.log_message.emit("[AUDIO] Creating virtual microphone source …")
         source_props = (
             f"device.description=\"{REMAP_NAME}\" "
@@ -373,20 +386,22 @@ class StreamWorker(QThread):
             f"  → remap source module id {self._remap_source_module_id}"
         )
 
-        # 3. Audio Preview Loopback (plays mic to speakers)
-        self.log_message.emit("[AUDIO] Starting audio preview (loopback to speakers) …")
-        try:
-            out_loopback = _run_pactl(
-                [
-                    "load-module",
-                    "module-loopback",
-                    f"source={REMAP_NAME}",
-                    "latency_msec=50",
-                ]
-            )
-            self._loopback_module_id = int(out_loopback)
-        except Exception as exc:
-            self.log_message.emit(f"[AUDIO] Warning creating loopback: {exc}")
+        if not self._stop_mic_preview:
+            self.log_message.emit("[AUDIO] Starting audio preview (loopback to speakers) …")
+            try:
+                out_loopback = _run_pactl(
+                    [
+                        "load-module",
+                        "module-loopback",
+                        f"source={REMAP_NAME}",
+                        "latency_msec=50",
+                    ]
+                )
+                self._loopback_module_id = int(out_loopback)
+            except Exception as exc:
+                self.log_message.emit(f"[AUDIO] Warning creating loopback: {exc}")
+        else:
+            self.log_message.emit("[AUDIO] Audio preview skipped (Stop Mic Preview is ON)")
 
     def _dump_audio_state(self) -> None:
         self.log_message.emit("[AUDIO] PipeWire nodes:")
@@ -423,9 +438,6 @@ class StreamWorker(QThread):
             pass
         return out
 
-    # ------------------------------------------------------------------
-    # scrcpy
-    # ------------------------------------------------------------------
     def _start_scrcpy(self) -> None:
         cmd = _scrcpy_cmd(
             self._mode, self._no_preview, self._camera_id, self._audio_source,
@@ -459,10 +471,8 @@ class StreamWorker(QThread):
         self.log_message.emit(f"[SCRCPY] Started (pid {self._scrcpy_proc.pid})")
 
     def _ensure_scrcpy_audio_routed(self) -> bool:
-        """Ensure scrcpy audio streams are routed to Phone_Audio_Sink and disconnected from physical speakers/easyeffects."""
         found = False
         try:
-            # 1. Move sink input via pactl
             out = subprocess.run(
                 ["pactl", "list", "sink-inputs"],
                 capture_output=True,
@@ -486,7 +496,6 @@ class StreamWorker(QThread):
                     found = True
                     break
 
-            # 2. Reroute PipeWire links statefully
             pw_out = subprocess.run(
                 ["pw-link", "-l"], capture_output=True, text=True, timeout=3
             ).stdout
@@ -623,7 +632,265 @@ class StreamWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# GUI
+# Custom UI Components matching Modern Dashboard Aesthetics
+# ---------------------------------------------------------------------------
+
+class ToggleSwitch(QWidget):
+    """Modern iOS/Android style animated toggle switch."""
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, parent=None, checked=False):
+        super().__init__(parent)
+        self._checked = checked
+        self.setFixedSize(44, 24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool) -> None:
+        if self._checked != checked:
+            self._checked = checked
+            self.update()
+            self.toggled.emit(self._checked)
+
+    def setEnabled(self, enabled: bool) -> None:
+        super().setEnabled(enabled)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
+            self.setChecked(not self._checked)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Track Color
+        if not self.isEnabled():
+            bg_color = QColor("#1e293b")
+        elif self._checked:
+            bg_color = QColor("#6366f1")  # Vibrant indigo / purple
+        else:
+            bg_color = QColor("#334155")  # Dark gray off
+
+        # Draw track
+        painter.setBrush(bg_color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(0, 0, self.width(), self.height(), 12, 12)
+
+        # Draw thumb knob
+        thumb_color = QColor("#ffffff") if self.isEnabled() else QColor("#94a3b8")
+        painter.setBrush(thumb_color)
+        thumb_x = self.width() - 21 if self._checked else 3
+        painter.drawEllipse(thumb_x, 3, 18, 18)
+
+
+class SegmentedControl(QWidget):
+    """Modern Segmented Mode Selector Bar."""
+    modeChanged = pyqtSignal(str)
+
+    def __init__(self, modes: list[str], current_mode: str = "", parent=None):
+        super().__init__(parent)
+        self._modes = modes
+        self._buttons: dict[str, QPushButton] = {}
+        self._current_mode = current_mode or (modes[0] if modes else "")
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        self.setStyleSheet("""
+            SegmentedControl {
+                background-color: #0f172a;
+                border-radius: 8px;
+                border: 1px solid #1e293b;
+            }
+        """)
+
+        for mode in self._modes:
+            btn = QPushButton(mode)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setMinimumHeight(34)
+            btn.clicked.connect(lambda checked, m=mode: self.set_current_mode(m))
+            self._buttons[mode] = btn
+            layout.addWidget(btn)
+
+        self._update_styles()
+
+    def currentMode(self) -> str:
+        return self._current_mode
+
+    def set_current_mode(self, mode: str) -> None:
+        if mode in self._modes and self._current_mode != mode:
+            self._current_mode = mode
+            self._update_styles()
+            self.modeChanged.emit(mode)
+
+    def _update_styles(self) -> None:
+        for mode, btn in self._buttons.items():
+            is_active = (mode == self._current_mode)
+            btn.setChecked(is_active)
+            if is_active:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #6366f1;
+                        color: #ffffff;
+                        border-radius: 6px;
+                        font-weight: bold;
+                        font-size: 13px;
+                        border: none;
+                        padding: 0 16px;
+                    }
+                """)
+            else:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: transparent;
+                        color: #94a3b8;
+                        border-radius: 6px;
+                        font-size: 13px;
+                        border: none;
+                        padding: 0 16px;
+                    }
+                    QPushButton:hover {
+                        background-color: #1e293b;
+                        color: #f8fafc;
+                    }
+                """)
+
+
+class StatusPill(QWidget):
+    """Status Pill Badge with colored indicator dot."""
+    def __init__(
+        self,
+        text: str = "",
+        active: bool = False,
+        active_color: str = "#10b981",
+        inactive_color: str = "#ef4444",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._text = text
+        self._active = active
+        self._active_color = active_color
+        self._inactive_color = inactive_color
+        self._label = QLabel(text)
+        self._dot = QLabel()
+        self._dot.setFixedSize(8, 8)
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(6)
+
+        self.setStyleSheet("""
+            StatusPill {
+                background-color: #1e293b;
+                border-radius: 12px;
+                border: 1px solid #334155;
+            }
+        """)
+
+        self._label.setStyleSheet(
+            "color: #e2e8f0; font-size: 12px; font-weight: 500; border: none; background: transparent;"
+        )
+        layout.addWidget(self._dot)
+        layout.addWidget(self._label)
+        self.update_status(self._active, self._text)
+
+    def update_status(self, active: bool, text: str | None = None) -> None:
+        self._active = active
+        if text is not None:
+            self._text = text
+            self._label.setText(self._text)
+        color = self._active_color if self._active else self._inactive_color
+        self._dot.setStyleSheet(
+            f"background-color: {color}; border-radius: 4px; border: none;"
+        )
+
+
+class StateBadge(QWidget):
+    """Badge for current execution state (IDLE / RUNNING / RESTARTING)."""
+    def __init__(self, state: str = "IDLE", parent=None):
+        super().__init__(parent)
+        self._label = QLabel(state)
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(0)
+
+        self._label.setStyleSheet("""
+            color: #ffffff;
+            font-size: 11px;
+            font-weight: bold;
+            letter-spacing: 0.5px;
+            background: transparent;
+            border: none;
+        """)
+        layout.addWidget(self._label)
+        self.set_state("IDLE")
+
+    def set_state(self, state: str) -> None:
+        self._label.setText(state.upper())
+        if state.upper() in ("RUNNING", "RUNNING…"):
+            self.setStyleSheet("""
+                StateBadge {
+                    background-color: #0284c7;
+                    border-radius: 10px;
+                    border: none;
+                }
+            """)
+        elif "STARTING" in state.upper() or "RESTARTING" in state.upper():
+            self.setStyleSheet("""
+                StateBadge {
+                    background-color: #d97706;
+                    border-radius: 10px;
+                    border: none;
+                }
+            """)
+        elif "ERROR" in state.upper():
+            self.setStyleSheet("""
+                StateBadge {
+                    background-color: #dc2626;
+                    border-radius: 10px;
+                    border: none;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                StateBadge {
+                    background-color: #0e7490;
+                    border-radius: 10px;
+                    border: none;
+                }
+            """)
+
+
+class CardWidget(QFrame):
+    """Custom Card container with rounded borders and dark gradient background."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("""
+            CardWidget {
+                background-color: #181b26;
+                border-radius: 12px;
+                border: 1px solid #2e3548;
+            }
+            CardWidget QLabel {
+                background-color: transparent;
+                border: none;
+            }
+        """)
+
+
+# ---------------------------------------------------------------------------
+# Main GUI Window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -631,140 +898,527 @@ class MainWindow(QMainWindow):
         self._worker: StreamWorker | None = None
         self._init_ui()
         self._connect_signals()
+        self._start_status_timer()
 
     def _init_ui(self) -> None:
-        self.setWindowTitle("Android Virtual Camera & Mic")
-        self.setMinimumSize(720, 560)
+        self.setWindowTitle("VirtualSource Console")
+        self.setMinimumSize(840, 680)
 
+        # Central widget with background styling
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        central.setStyleSheet("""
+            QWidget {
+                background-color: #0f121d;
+            }
+            QLabel {
+                background-color: transparent;
+                border: none;
+            }
+        """)
 
-        # Status
-        self._status_lbl = QLabel("Ready")
-        self._status_lbl.setStyleSheet(
-            "font-size: 16px; font-weight: bold; padding: 4px 0;"
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(16)
+
+        # -------------------------------------------------------------------
+        # 1. Header Bar
+        # -------------------------------------------------------------------
+        header_layout = QHBoxLayout()
+
+        # Logo + Title
+        title_label = QLabel("VirtualSource Console")
+        title_label.setStyleSheet(
+            "font-size: 20px; font-weight: bold; color: #f8fafc; background: transparent; border: none;"
         )
-        layout.addWidget(self._status_lbl)
+        header_layout.addWidget(title_label)
+        header_layout.addStretch(1)
 
-        # Mode selector + options + buttons
-        top_row = QHBoxLayout()
-        self._mode_combo = QComboBox()
-        self._mode_combo.addItems([MODE_VIDEO_AUDIO, MODE_VIDEO_ONLY, MODE_AUDIO_ONLY])
-        self._mode_combo.setMinimumHeight(40)
-        self._mode_combo.setMinimumWidth(150)
-        top_row.addWidget(self._mode_combo)
+        # Status Pills
+        self._adb_pill = StatusPill("ADB: Checking...", active=False)
+        self._v4l2_pill = StatusPill("v4l2loopback: Checking...", active=False)
+        self._state_badge = StateBadge("IDLE")
+
+        header_layout.addWidget(self._adb_pill)
+        header_layout.addWidget(self._v4l2_pill)
+        header_layout.addWidget(self._state_badge)
+
+        # Refresh Icon Button
+        self._hdr_refresh_btn = QPushButton("Refresh")
+        self._hdr_refresh_btn.setFixedHeight(34)
+        self._hdr_refresh_btn.setMinimumWidth(80)
+        self._hdr_refresh_btn.setToolTip("Refresh Device & Status")
+        self._hdr_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hdr_refresh_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                color: #f8fafc;
+                font-size: 13px;
+                padding: 0 10px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+        """)
+        header_layout.addWidget(self._hdr_refresh_btn)
+
+        # Terminal / Info Icon Button
+        self._hdr_term_btn = QPushButton("Console")
+        self._hdr_term_btn.setFixedHeight(34)
+        self._hdr_term_btn.setMinimumWidth(80)
+        self._hdr_term_btn.setToolTip("Console Mode")
+        self._hdr_term_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hdr_term_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                color: #f8fafc;
+                font-size: 13px;
+                padding: 0 10px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+        """)
+        header_layout.addWidget(self._hdr_term_btn)
+
+        main_layout.addLayout(header_layout)
+
+        # -------------------------------------------------------------------
+        # 2. Card: Stream Control
+        # -------------------------------------------------------------------
+        stream_card = CardWidget()
+        stream_layout = QVBoxLayout(stream_card)
+        stream_layout.setContentsMargins(18, 16, 18, 16)
+        stream_layout.setSpacing(12)
+
+        # Card Title
+        sc_title = QLabel("Stream Control")
+        sc_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #f1f5f9; background: transparent; border: none;")
+        stream_layout.addWidget(sc_title)
+
+        stream_body = QHBoxLayout()
+
+        # Operating Mode Selector
+        mode_box = QVBoxLayout()
+        mode_box.setSpacing(6)
+        mode_lbl = QLabel("OPERATING MODE")
+        mode_lbl.setStyleSheet(
+            "font-size: 11px; font-weight: 600; color: #94a3b8; letter-spacing: 0.5px; background: transparent; border: none;"
+        )
+        mode_box.addWidget(mode_lbl)
+
+        self._segmented_mode = SegmentedControl(
+            [MODE_VIDEO_AUDIO, MODE_VIDEO_ONLY, MODE_AUDIO_ONLY],
+            current_mode=MODE_VIDEO_AUDIO,
+        )
+        mode_box.addWidget(self._segmented_mode)
+        stream_body.addLayout(mode_box, stretch=1)
+        stream_body.addSpacing(24)
+
+        # Action Buttons (Start / Stop)
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(10)
+
+        self._start_btn = QPushButton("Start Stream")
+        self._start_btn.setMinimumHeight(42)
+        self._start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #10b981;
+                color: #ffffff;
+                border-radius: 8px;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 0 24px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+            QPushButton:disabled {
+                background-color: #1f2937;
+                color: #4b5563;
+            }
+        """)
+
+        self._stop_btn = QPushButton("Stop Stream")
+        self._stop_btn.setMinimumHeight(42)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #374151;
+                color: #9ca3af;
+                border-radius: 8px;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 0 24px;
+                border: none;
+            }
+            QPushButton:enabled {
+                background-color: #dc2626;
+                color: #ffffff;
+            }
+            QPushButton:enabled:hover {
+                background-color: #b91c1c;
+            }
+            QPushButton:disabled {
+                background-color: #1f2937;
+                color: #4b5563;
+            }
+        """)
+
+        btn_box.addWidget(self._start_btn)
+        btn_box.addWidget(self._stop_btn)
+        stream_body.addLayout(btn_box)
+
+        stream_layout.addLayout(stream_body)
+        main_layout.addWidget(stream_card)
+
+        # -------------------------------------------------------------------
+        # 3. Two Column Layout: Video Settings & Audio Settings
+        # -------------------------------------------------------------------
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(16)
+
+        # ---------------- Video Settings Card ----------------
+        video_card = CardWidget()
+        video_layout = QVBoxLayout(video_card)
+        video_layout.setContentsMargins(18, 16, 18, 16)
+        video_layout.setSpacing(14)
+
+        # Video Header
+        v_hdr_layout = QHBoxLayout()
+        v_title = QLabel("Video Settings")
+        v_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #f1f5f9; background: transparent; border: none;")
+        v_hdr_layout.addWidget(v_title)
+        v_hdr_layout.addStretch(1)
+
+        self._cam_refresh_btn = QPushButton("Refresh")
+        self._cam_refresh_btn.setFixedHeight(28)
+        self._cam_refresh_btn.setMinimumWidth(70)
+        self._cam_refresh_btn.setToolTip("Refresh Camera List")
+        self._cam_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cam_refresh_btn.setStyleSheet("""
+            QPushButton {
+                background-color: transparent;
+                color: #94a3b8;
+                border: none;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                color: #f8fafc;
+            }
+        """)
+        v_hdr_layout.addWidget(self._cam_refresh_btn)
+        video_layout.addLayout(v_hdr_layout)
+
+        # Camera Dropdown Box
+        cam_box = QVBoxLayout()
+        cam_box.setSpacing(6)
+        cam_lbl = QLabel("CAMERA SOURCE")
+        cam_lbl.setStyleSheet(
+            "font-size: 11px; font-weight: 600; color: #94a3b8; letter-spacing: 0.5px; background: transparent; border: none;"
+        )
+        cam_box.addWidget(cam_lbl)
 
         self._camera_combo = QComboBox()
-        self._camera_combo.setMinimumHeight(40)
-        self._camera_combo.setMinimumWidth(220)
-        top_row.addWidget(self._camera_combo, stretch=1)
+        self._camera_combo.setMinimumHeight(38)
+        self._camera_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #0f172a;
+                border: 1px solid #2e3548;
+                border-radius: 6px;
+                padding: 6px 12px;
+                color: #f8fafc;
+                font-size: 13px;
+            }
+            QComboBox:hover {
+                border-color: #475569;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #181b26;
+                border: 1px solid #2e3548;
+                selection-background-color: #6366f1;
+                color: #f8fafc;
+            }
+        """)
+        cam_box.addWidget(self._camera_combo)
+        video_layout.addLayout(cam_box)
 
-        self._refresh_cams_btn = QPushButton("🔄 Refresh")
-        self._refresh_cams_btn.setMinimumHeight(40)
-        self._refresh_cams_btn.setToolTip("Query connected Android device for available cameras")
-        top_row.addWidget(self._refresh_cams_btn)
+        # Toggles
+        self._flip_h_switch = ToggleSwitch()
+        self._flip_v_switch = ToggleSwitch()
+        self._stop_cam_prev_switch = ToggleSwitch()
 
-        self._start_btn = QPushButton("▶  Start")
-        self._start_btn.setMinimumHeight(40)
-        self._stop_btn = QPushButton("■  Stop")
-        self._stop_btn.setMinimumHeight(40)
-        self._stop_btn.setEnabled(False)
-        top_row.addWidget(self._start_btn)
-        top_row.addWidget(self._stop_btn)
-        layout.addLayout(top_row)
+        def _make_toggle_row(label_text: str, switch_widget: ToggleSwitch) -> QHBoxLayout:
+            row = QHBoxLayout()
+            lbl = QLabel(label_text)
+            lbl.setStyleSheet("color: #e2e8f0; font-size: 13px; background: transparent; border: none;")
+            row.addWidget(lbl)
+            row.addStretch(1)
+            row.addWidget(switch_widget)
+            return row
 
-        # Video options row
-        video_options_row = QHBoxLayout()
-        self._flip_h_cb = QCheckBox("Flip Horizontal")
-        self._flip_v_cb = QCheckBox("Flip Vertical")
-        video_options_row.addWidget(self._flip_h_cb)
-        video_options_row.addWidget(self._flip_v_cb)
-        video_options_row.addStretch(1)
-        layout.addLayout(video_options_row)
+        video_layout.addLayout(_make_toggle_row("Flip Horizontal", self._flip_h_switch))
+        video_layout.addLayout(_make_toggle_row("Flip Vertical", self._flip_v_switch))
+        video_layout.addLayout(_make_toggle_row("Stop Cam Preview", self._stop_cam_prev_switch))
 
-        # Preview Control Buttons
-        preview_row = QHBoxLayout()
-        self._stop_cam_preview_btn = QPushButton("Stop Cam Preview")
-        self._stop_mic_preview_btn = QPushButton("Stop Mic Preview")
-        self._stop_cam_preview_btn.setEnabled(False)
-        self._stop_mic_preview_btn.setEnabled(False)
-        self._stop_cam_preview_btn.setMinimumHeight(35)
-        self._stop_mic_preview_btn.setMinimumHeight(35)
-        preview_row.addWidget(self._stop_cam_preview_btn)
-        preview_row.addWidget(self._stop_mic_preview_btn)
-        layout.addLayout(preview_row)
+        settings_row.addWidget(video_card, stretch=1)
 
-        # Audio options row
-        audio_row = QHBoxLayout()
+        # ---------------- Audio Settings Card ----------------
+        audio_card = CardWidget()
+        audio_layout = QVBoxLayout(audio_card)
+        audio_layout.setContentsMargins(18, 16, 18, 16)
+        audio_layout.setSpacing(14)
+
+        # Audio Header
+        a_title = QLabel("Audio Settings")
+        a_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #f1f5f9; background: transparent; border: none;")
+        audio_layout.addWidget(a_title)
+
+        # Audio Source Dropdown
+        aud_box = QVBoxLayout()
+        aud_box.setSpacing(6)
+        aud_lbl = QLabel("AUDIO SOURCE")
+        aud_lbl.setStyleSheet(
+            "font-size: 11px; font-weight: 600; color: #94a3b8; letter-spacing: 0.5px; background: transparent; border: none;"
+        )
+        aud_box.addWidget(aud_lbl)
+
         self._audio_src_combo = QComboBox()
         self._audio_src_combo.addItems([AUDIO_SRC_MIC, AUDIO_SRC_OUTPUT])
-        self._audio_src_combo.setToolTip("Select audio source on Android device")
-        self._audio_src_combo.setMinimumHeight(35)
+        self._audio_src_combo.setMinimumHeight(38)
+        self._audio_src_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #0f172a;
+                border: 1px solid #2e3548;
+                border-radius: 6px;
+                padding: 6px 12px;
+                color: #f8fafc;
+                font-size: 13px;
+            }
+            QComboBox:hover {
+                border-color: #475569;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #181b26;
+                border: 1px solid #2e3548;
+                selection-background-color: #6366f1;
+                color: #f8fafc;
+            }
+        """)
+        aud_box.addWidget(self._audio_src_combo)
+        audio_layout.addLayout(aud_box)
 
-        lbl_src = QLabel("Audio Source:")
-        audio_row.addWidget(lbl_src)
-        audio_row.addWidget(self._audio_src_combo)
-        audio_row.addStretch(1)
-        layout.addLayout(audio_row)
+        # Virtual Sink Info Box
+        info_box = QFrame()
+        info_box.setStyleSheet("""
+            QFrame {
+                background-color: #0f172a;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+        """)
+        info_box_layout = QVBoxLayout(info_box)
+        info_box_layout.setContentsMargins(8, 8, 8, 8)
+        info_box_layout.setSpacing(4)
 
-        # v4l2loopback hint
-        hint_group = QGroupBox("Prerequisite — v4l2loopback (run once per boot)")
-        hint_layout = QVBoxLayout(hint_group)
-        hint = QLabel(
-            'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Phone Camera"'
+        info_header = QLabel("Virtual Sink Identity")
+        info_header.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 500; background: transparent; border: none;")
+        info_val = QLabel(REMAP_NAME)
+        info_val.setStyleSheet(
+            "color: #38bdf8; font-family: monospace; font-size: 13px; font-weight: bold; background: transparent; border: none;"
         )
-        hint.setStyleSheet(
-            "font-family: monospace; background: #2d2d2d; color: #f0f0f0;"
-            " padding: 8px; border-radius: 4px;"
-        )
-        hint.setTextInteractionFlags(
-            hint.textInteractionFlags() | Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        hint_layout.addWidget(hint)
-        layout.addWidget(hint_group)
 
-        # Virtual mic info
-        self._mic_info = QLabel(
-            "Virtual mic: <b>Phone_Virtual_Microphone</b> — "
-            "select it in EasyEffects / OBS / Meet / Discord"
-        )
-        self._mic_info.setWordWrap(True)
-        self._mic_info.setStyleSheet("padding: 4px 0;")
-        layout.addWidget(self._mic_info)
+        info_box_layout.addWidget(info_header)
+        info_box_layout.addWidget(info_val)
+        audio_layout.addWidget(info_box)
 
-        # Log viewer
-        log_group = QGroupBox("Log")
-        log_layout = QVBoxLayout(log_group)
+        # Mic Preview Toggle Switch
+        self._stop_mic_prev_switch = ToggleSwitch()
+        audio_layout.addLayout(_make_toggle_row("Stop Mic Preview", self._stop_mic_prev_switch))
+
+        settings_row.addWidget(audio_card, stretch=1)
+        main_layout.addLayout(settings_row)
+
+        # -------------------------------------------------------------------
+        # 4. Card: Prerequisites Setup
+        # -------------------------------------------------------------------
+        prereq_card = CardWidget()
+        prereq_layout = QVBoxLayout(prereq_card)
+        prereq_layout.setContentsMargins(18, 14, 18, 14)
+        prereq_layout.setSpacing(8)
+
+        prereq_title = QLabel("Prerequisites Setup")
+        prereq_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #f1f5f9; background: transparent; border: none;")
+        prereq_sub = QLabel("Run this command once per session to load the loopback module.")
+        prereq_sub.setStyleSheet("font-size: 12px; color: #94a3b8; background: transparent; border: none;")
+
+        prereq_layout.addWidget(prereq_title)
+        prereq_layout.addWidget(prereq_sub)
+
+        cmd_box = QHBoxLayout()
+        cmd_box.setSpacing(8)
+
+        cmd_text = QLabel('sudo modprobe v4l2loopback exclusive_caps=1 card_label="Phone Camera"')
+        cmd_text.setStyleSheet("""
+            QLabel {
+                background-color: #090d16;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                color: #e2e8f0;
+                font-family: monospace;
+                font-size: 12px;
+                padding: 10px 14px;
+            }
+        """)
+        cmd_text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        cmd_box.addWidget(cmd_text, stretch=1)
+
+        self._copy_prereq_btn = QPushButton("Copy")
+        self._copy_prereq_btn.setFixedHeight(38)
+        self._copy_prereq_btn.setMinimumWidth(70)
+        self._copy_prereq_btn.setToolTip("Copy Command")
+        self._copy_prereq_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_prereq_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                color: #f8fafc;
+                font-size: 13px;
+                padding: 0 10px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+        """)
+        cmd_box.addWidget(self._copy_prereq_btn)
+        prereq_layout.addLayout(cmd_box)
+        main_layout.addWidget(prereq_card)
+
+        # -------------------------------------------------------------------
+        # 5. Card: Console Output
+        # -------------------------------------------------------------------
+        console_card = CardWidget()
+        console_layout = QVBoxLayout(console_card)
+        console_layout.setContentsMargins(18, 14, 18, 14)
+        console_layout.setSpacing(10)
+
+        c_hdr = QHBoxLayout()
+        c_title = QLabel("Console Output")
+        c_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #f1f5f9; background: transparent; border: none;")
+        c_hdr.addWidget(c_title)
+        c_hdr.addStretch(1)
+
+        self._clear_log_btn = QPushButton("Clear")
+        self._clear_log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_log_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                color: #94a3b8;
+                font-size: 12px;
+                padding: 4px 12px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #f8fafc;
+            }
+        """)
+
+        self._copy_log_btn = QPushButton("Copy")
+        self._copy_log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_log_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                color: #94a3b8;
+                font-size: 12px;
+                padding: 4px 12px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #f8fafc;
+            }
+        """)
+
+        c_hdr.addWidget(self._clear_log_btn)
+        c_hdr.addWidget(self._copy_log_btn)
+        console_layout.addLayout(c_hdr)
+
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setStyleSheet("font-family: monospace; font-size: 12px;")
-        log_layout.addWidget(self._log_view)
-        layout.addWidget(log_group, stretch=1)
+        self._log_view.setMinimumHeight(140)
+        self._log_view.setStyleSheet("""
+            QTextEdit {
+                background-color: #090d16;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+                color: #e2e8f0;
+                font-family: monospace;
+                font-size: 12px;
+                padding: 10px;
+            }
+        """)
+        console_layout.addWidget(self._log_view, stretch=1)
+        main_layout.addWidget(console_card, stretch=1)
 
-        # Initial camera population
+        # Initial camera list populate & status check
         self._on_refresh_cameras()
+        self._check_system_status()
 
+    # ------------------------------------------------------------------
+    # Signal Connections
+    # ------------------------------------------------------------------
     def _connect_signals(self) -> None:
         self._start_btn.clicked.connect(self._on_start)
         self._stop_btn.clicked.connect(self._on_stop)
-        self._refresh_cams_btn.clicked.connect(self._on_refresh_cameras)
-        self._stop_cam_preview_btn.clicked.connect(self._on_stop_cam_preview)
-        self._stop_mic_preview_btn.clicked.connect(self._on_stop_mic_preview)
-        self._flip_h_cb.stateChanged.connect(self._on_flip_changed)
-        self._flip_v_cb.stateChanged.connect(self._on_flip_changed)
+        self._hdr_refresh_btn.clicked.connect(self._check_system_status)
+        self._cam_refresh_btn.clicked.connect(self._on_refresh_cameras)
 
-    def _create_worker(self) -> None:
-        self._worker = StreamWorker()
-        self._worker.log_message.connect(self._append_log)
-        self._worker.status_changed.connect(self._on_status_changed)
-        self._worker.error_occurred.connect(self._on_error)
-        self._worker.finished.connect(self._on_worker_finished)
+        self._flip_h_switch.toggled.connect(self._on_flip_changed)
+        self._flip_v_switch.toggled.connect(self._on_flip_changed)
+        self._stop_cam_prev_switch.toggled.connect(self._on_stop_cam_preview_toggled)
+        self._stop_mic_prev_switch.toggled.connect(self._on_stop_mic_preview_toggled)
+
+        self._copy_prereq_btn.clicked.connect(self._copy_prereq_command)
+        self._clear_log_btn.clicked.connect(self._log_view.clear)
+        self._copy_log_btn.clicked.connect(self._copy_logs)
 
     # ------------------------------------------------------------------
-    # Slots
+    # Status Polling Timer
+    # ------------------------------------------------------------------
+    def _start_status_timer(self) -> None:
+        self._timer = QTimer(self)
+        self._timer.setInterval(3000)  # Check every 3s
+        self._timer.timeout.connect(self._check_system_status)
+        self._timer.start()
+
+    @pyqtSlot()
+    def _check_system_status(self) -> None:
+        adb_connected = self._adb_device_connected()
+        v4l2_loaded = self._check_v4l2loopback()
+
+        self._adb_pill.update_status(
+            adb_connected, "ADB: Connected" if adb_connected else "ADB: Disconnected"
+        )
+        self._v4l2_pill.update_status(
+            v4l2_loaded, "v4l2loopback: Loaded" if v4l2_loaded else "v4l2loopback: Not Loaded"
+        )
+
+    # ------------------------------------------------------------------
+    # Actions & Slots
     # ------------------------------------------------------------------
     @pyqtSlot()
     def _on_refresh_cameras(self) -> None:
@@ -776,35 +1430,64 @@ class MainWindow(QMainWindow):
                 self._camera_combo.addItem(label, cam_id)
             self._append_log(f"[GUI] Found {len(cameras)} camera(s).")
         else:
+            self._camera_combo.addItem("Camera 0 (back, 4080x3060)", "0")
             self._camera_combo.addItem("Front Camera (Default)", "front")
-            self._camera_combo.addItem("Back Camera (Default)", "back")
-            self._append_log("[GUI] No cameras returned (or no device connected). Using defaults.")
+            self._append_log("[GUI] Using default camera fallback.")
 
-    @pyqtSlot()
-    def _on_flip_changed(self) -> None:
+    @pyqtSlot(bool)
+    def _on_flip_changed(self, _: bool) -> None:
         if self._worker is not None and self._worker._running:
-            flip_h = self._flip_h_cb.isChecked()
-            flip_v = self._flip_v_cb.isChecked()
-            self._flip_h_cb.setEnabled(False)
-            self._flip_v_cb.setEnabled(False)
+            flip_h = self._flip_h_switch.isChecked()
+            flip_v = self._flip_v_switch.isChecked()
             self._worker.update_flip(flip_h, flip_v)
 
-    @pyqtSlot(str)
-    def _on_status_changed(self, status: str) -> None:
-        self._status_lbl.setText(status)
-        if status == "Running…":
-            self._flip_h_cb.setEnabled(True)
-            self._flip_v_cb.setEnabled(True)
+    @pyqtSlot(bool)
+    def _on_stop_cam_preview_toggled(self, checked: bool) -> None:
+        if self._worker is not None and self._worker._running:
+            if checked:
+                self._worker.stop_cam_preview()
+            else:
+                self._worker.start_cam_preview()
+
+    @pyqtSlot(bool)
+    def _on_stop_mic_preview_toggled(self, checked: bool) -> None:
+        if self._worker is not None and self._worker._running:
+            if checked:
+                self._worker.stop_mic_preview()
+            else:
+                self._worker.start_mic_preview()
+
+    @pyqtSlot()
+    def _copy_prereq_command(self) -> None:
+        cmd = 'sudo modprobe v4l2loopback exclusive_caps=1 card_label="Phone Camera"'
+        QApplication.clipboard().setText(cmd)
+        self._copy_prereq_btn.setText("Copied")
+        QTimer.singleShot(1500, lambda: self._copy_prereq_btn.setText("Copy"))
+
+    @pyqtSlot()
+    def _copy_logs(self) -> None:
+        QApplication.clipboard().setText(self._log_view.toPlainText())
+        self._copy_log_btn.setText("Copied")
+        QTimer.singleShot(1500, lambda: self._copy_log_btn.setText("Copy"))
+
+    def _create_worker(self) -> None:
+        self._worker = StreamWorker()
+        self._worker.log_message.connect(self._append_log)
+        self._worker.status_changed.connect(self._on_status_changed)
+        self._worker.error_occurred.connect(self._on_error)
+        self._worker.finished.connect(self._on_worker_finished)
 
     @pyqtSlot()
     def _on_start(self) -> None:
-        mode = self._mode_combo.currentText()
+        mode = self._segmented_mode.currentMode()
         camera_id = self._camera_combo.currentData()
         audio_src_key = (
             "mic" if self._audio_src_combo.currentText() == AUDIO_SRC_MIC else "output"
         )
-        flip_h = self._flip_h_cb.isChecked()
-        flip_v = self._flip_v_cb.isChecked()
+        flip_h = self._flip_h_switch.isChecked()
+        flip_v = self._flip_v_switch.isChecked()
+        stop_cam_preview = self._stop_cam_prev_switch.isChecked()
+        stop_mic_preview = self._stop_mic_prev_switch.isChecked()
 
         if mode != MODE_AUDIO_ONLY:
             if not self._check_v4l2loopback():
@@ -830,72 +1513,77 @@ class MainWindow(QMainWindow):
 
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
-        self._stop_cam_preview_btn.setEnabled(True)
-        self._stop_mic_preview_btn.setEnabled(True)
-        self._flip_h_cb.setEnabled(False)
-        self._flip_v_cb.setEnabled(False)
-        self._log_view.clear()
-        self._status_lbl.setText("Starting…")
+        self._state_badge.set_state("Starting…")
         self._append_log(
-            f"[GUI] Starting — mode: {mode}, camera_id: {camera_id}, audio_source: {audio_src_key}"
+            f"[GUI] Starting — mode: {mode}, camera_id: {camera_id}, audio_source: {audio_src_key}, stop_cam_prev: {stop_cam_preview}, stop_mic_prev: {stop_mic_preview}"
         )
         self._create_worker()
-        self._worker.start_stream(mode, camera_id, audio_src_key, flip_h, flip_v)
+        self._worker.start_stream(
+            mode, camera_id, audio_src_key, flip_h, flip_v, stop_cam_preview, stop_mic_preview
+        )
 
     @pyqtSlot()
     def _on_stop(self) -> None:
-        self._status_lbl.setText("Stopping…")
+        self._state_badge.set_state("Stopping…")
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(False)
-        self._stop_cam_preview_btn.setEnabled(False)
-        self._stop_mic_preview_btn.setEnabled(False)
         self._append_log("[GUI] Stopping stream worker …")
         if self._worker is not None:
             self._worker.stop_stream()
 
-    @pyqtSlot()
-    def _on_stop_cam_preview(self) -> None:
-        self._stop_cam_preview_btn.setEnabled(False)
-        if self._worker is not None:
-            self._worker.stop_cam_preview()
-
-    @pyqtSlot()
-    def _on_stop_mic_preview(self) -> None:
-        self._stop_mic_preview_btn.setEnabled(False)
-        if self._worker is not None:
-            self._worker.stop_mic_preview()
+    @pyqtSlot(str)
+    def _on_status_changed(self, status: str) -> None:
+        self._state_badge.set_state(status)
 
     @pyqtSlot(str)
     def _on_error(self, msg: str) -> None:
-        self._append_log(f"[GUI] Error: {msg}")
-        self._status_lbl.setText("Error")
+        self._append_log(f"[ERROR] {msg}")
+        self._state_badge.set_state("Error")
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._stop_cam_preview_btn.setEnabled(False)
-        self._stop_mic_preview_btn.setEnabled(False)
-        self._flip_h_cb.setEnabled(True)
-        self._flip_v_cb.setEnabled(True)
 
     @pyqtSlot()
     def _on_worker_finished(self) -> None:
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._stop_cam_preview_btn.setEnabled(False)
-        self._stop_mic_preview_btn.setEnabled(False)
-        self._flip_h_cb.setEnabled(True)
-        self._flip_v_cb.setEnabled(True)
-        lbl = self._status_lbl.text()
-        if lbl in ("Starting…", "Running…", "Stopping…", "Restarting…", "Error"):
-            self._status_lbl.setText("Ready")
+        self._state_badge.set_state("IDLE")
 
     @pyqtSlot(str)
     def _append_log(self, text: str) -> None:
-        self._log_view.append(text)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = text
+
+        if "[INFO]" in text:
+            formatted = text.replace(
+                "[INFO]", f'<span style="color: #10b981; font-weight: bold;">[INFO]</span> {now}'
+            )
+        elif "[SYSTEM]" in text:
+            formatted = text.replace(
+                "[SYSTEM]", f'<span style="color: #38bdf8; font-weight: bold;">[SYSTEM]</span> {now}'
+            )
+        elif "[SCRCPY]" in text:
+            formatted = text.replace(
+                "[SCRCPY]", f'<span style="color: #a855f7; font-weight: bold;">[SCRCPY]</span>'
+            )
+        elif "[AUDIO]" in text:
+            formatted = text.replace(
+                "[AUDIO]", f'<span style="color: #f59e0b; font-weight: bold;">[AUDIO]</span>'
+            )
+        elif "[ERROR]" in text:
+            formatted = text.replace(
+                "[ERROR]", f'<span style="color: #ef4444; font-weight: bold;">[ERROR]</span> {now}'
+            )
+        elif "[GUI]" in text:
+            formatted = text.replace(
+                "[GUI]", f'<span style="color: #6366f1; font-weight: bold;">[GUI]</span>'
+            )
+
+        self._log_view.append(formatted)
         sb = self._log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     # ------------------------------------------------------------------
-    # Pre-flight checks
+    # Pre-flight Checks
     # ------------------------------------------------------------------
     @staticmethod
     def _adb_device_connected() -> bool:
@@ -929,28 +1617,18 @@ class MainWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry Point
 # ---------------------------------------------------------------------------
 def main() -> None:
     os.environ.pop("QT_STYLE_OVERRIDE", None)
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.WindowText, QColor(220, 220, 220))
-    palette.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(25, 25, 25))
-    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(220, 220, 220))
-    palette.setColor(QPalette.ColorRole.Text, QColor(220, 220, 220))
-    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ButtonText, QColor(220, 220, 220))
-    palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(220, 220, 220))
-    app.setPalette(palette)
-
+    app.setStyleSheet("""
+        QLabel {
+            background-color: transparent;
+            border: none;
+        }
+    """)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
