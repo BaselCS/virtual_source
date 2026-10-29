@@ -1,0 +1,6 @@
+{
+    "python.defaultInterpreterPath": ".venv/bin/python",
+    "editor.formatOnSave": true,
+    "editor.lineNumbers": "relative",
+    "files.autoSave": "afterDelay"
+}

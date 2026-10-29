@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=VirtualSource
+GenericName=Virtual Camera & Microphone
+Comment=Turn Android phone into virtual camera and microphone using scrcpy and PipeWire
+Exec=/home/basel/.local/bin/virtual-source
+Icon=virtual-source
+Terminal=false
+Categories=AudioVideo;Utility;
+Keywords=android;webcam;camera;microphone;scrcpy;pipewire;v4l2;
+StartupWMClass=VirtualSource

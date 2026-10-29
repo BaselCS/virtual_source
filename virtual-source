@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# VirtualSource Application Launcher
+set -e
+
+APP_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# If installed in ~/.local/bin, point to actual project dir if separate
+if [ ! -f "$APP_DIR/android_virtual_cam_mic.py" ]; then
+    APP_DIR="/home/basel/Work/python/virtual_source"
+fi
+
+DIST_BIN="$APP_DIR/dist/virtual-source/virtual-source"
+
+if [ -x "$DIST_BIN" ]; then
+    exec "$DIST_BIN" "$@"
+elif command -v uv >/dev/null 2>&1; then
+    exec uv run --project "$APP_DIR" python "$APP_DIR/android_virtual_cam_mic.py" "$@"
+else
+    exec python3 "$APP_DIR/android_virtual_cam_mic.py" "$@"
+fi
